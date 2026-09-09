@@ -1,0 +1,154 @@
+services:
+  postgres:
+    image: postgres:16
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: openreply
+      POSTGRES_USER: openreply
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U openreply"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+    networks: [internal]
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+    networks: [internal]
+
+  web:
+    image: node:22-bookworm
+    restart: unless-stopped
+    working_dir: /app
+    environment:
+      NODE_ENV: production
+      NODE_OPTIONS: --max-old-space-size=4096
+      NEXTAUTH_URL: ${NEXTAUTH_URL}
+      NEXTAUTH_SECRET: ${NEXTAUTH_SECRET}
+      CRON_SECRET: ${CRON_SECRET}
+      ENCRYPTION_KEY: ${ENCRYPTION_KEY}
+      DATABASE_URL: postgresql://openreply:${POSTGRES_PASSWORD}@postgres:5432/openreply
+      REDIS_URL: redis://redis:6379
+      RESEND_API_KEY: ${RESEND_API_KEY}
+      EMAIL_FROM: onboarding@resend.dev
+      META_GRAPH_API_VERSION: ${META_GRAPH_API_VERSION}
+      INSTAGRAM_APP_ID: ${INSTAGRAM_APP_ID}
+      INSTAGRAM_APP_SECRET: ${INSTAGRAM_APP_SECRET}
+      FACEBOOK_APP_SECRET: ${FACEBOOK_APP_SECRET}
+      WEBHOOK_VERIFY_TOKEN: ${WEBHOOK_VERIFY_TOKEN}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      - appcode:/app
+    command:
+      - bash
+      - -lc
+      - |
+        set -euo pipefail
+        export DEBIAN_FRONTEND=noninteractive
+        apt-get update -qq
+        apt-get install -y -qq git ca-certificates
+        if [ ! -f /app/package.json ]; then
+          git clone --depth 1 https://github.com/diwenne/openreply.git /tmp/src
+          cp -a /tmp/src/. /app/
+          rm -rf /tmp/src
+        fi
+        if [ ! -x /app/node_modules/.bin/next ] || [ ! -x /app/node_modules/.bin/tsx ]; then
+          npm ci --include=dev
+        fi
+        npx prisma generate
+        npx prisma migrate deploy
+        if [ ! -f /app/.next/BUILD_ID ]; then
+          npm run build
+        fi
+        exec npx next start -H 0.0.0.0 -p 3000
+    expose:
+      - "3000"
+    networks: [internal]
+
+  worker:
+    image: node:22-bookworm
+    restart: unless-stopped
+    working_dir: /app
+    environment:
+      NODE_ENV: production
+      NEXTAUTH_URL: ${NEXTAUTH_URL}
+      NEXTAUTH_SECRET: ${NEXTAUTH_SECRET}
+      CRON_SECRET: ${CRON_SECRET}
+      ENCRYPTION_KEY: ${ENCRYPTION_KEY}
+      DATABASE_URL: postgresql://openreply:${POSTGRES_PASSWORD}@postgres:5432/openreply
+      REDIS_URL: redis://redis:6379
+      RESEND_API_KEY: ${RESEND_API_KEY}
+      EMAIL_FROM: onboarding@resend.dev
+      META_GRAPH_API_VERSION: ${META_GRAPH_API_VERSION}
+      INSTAGRAM_APP_ID: ${INSTAGRAM_APP_ID}
+      INSTAGRAM_APP_SECRET: ${INSTAGRAM_APP_SECRET}
+      FACEBOOK_APP_SECRET: ${FACEBOOK_APP_SECRET}
+      WEBHOOK_VERIFY_TOKEN: ${WEBHOOK_VERIFY_TOKEN}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      web:
+        condition: service_started
+    volumes:
+      - appcode:/app
+    command:
+      - bash
+      - -lc
+      - |
+        set -euo pipefail
+        while [ ! -x /app/node_modules/.bin/tsx ]; do
+          echo "waiting for web bootstrap..."
+          sleep 5
+        done
+        npx prisma generate
+        exec npx tsx worker/dm-worker.ts
+    networks: [internal]
+
+  caddy:
+    image: caddy:2
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    volumes:
+      - caddydata:/data
+      - caddyconfig:/config
+    command:
+      - caddy
+      - reverse-proxy
+      - --from
+      - familiaborch.tech
+      - --to
+      - web:3000
+    depends_on:
+      - web
+    networks: [internal]
+
+volumes:
+  pgdata:
+  redisdata:
+  appcode:
+  caddydata:
+  caddyconfig:
+
+networks:
+  internal:
